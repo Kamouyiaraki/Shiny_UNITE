@@ -5,6 +5,18 @@
 ### Goal
 This Shiny app checks which species from a list (e.g., UK lichens, NBN fungi) are represented in the UNITE database of ITS fungal sequences and optionally integrates GBIF/NBN synonym data.
 
+✅ Uses only one input file (user uploads a taxon list CSV).
+
+✅ Allows user to select the taxon name and taxon ID columns from that file.
+
+✅ Checks if taxon names and synonyms (from within that same file) are found in the selected UNITE database version.
+
+✅ Does not allow the user to upload a second synonym file.
+
+✅ Provides a clean UI, summary, and downloadable output.
+
+
+
 ### What You'll Need
 
 - R & RStudio installed
@@ -15,10 +27,8 @@ install.packages(c("shiny", "dplyr", "readr", "stringr"))
 ```
 
 ### Files you'll use
-- UNITE FASTA header file (.txt) or processed .csv file (e.g. UNITE_public_19.02.2025_headers_rfmt.csv)
+- The shiny app folder that includes the app R file and `data` directory
 - Taxon spreadsheet (e.g. lichen-list-201803.csv or fungal species.csv)
-
-**Optional:** Synonym file (e.g. 2025-04-30-uksi_species_synonyms(Sheet1).csv)
 
 
 ### Your shiny app will have the following directory structure
@@ -28,7 +38,8 @@ UNITE_TaxonMatcher_App/
 ├── app.R
 └── data/
     ├── UNITE_public_19.02.2025.csv
-    ├── UNITE_public_2024.04.11.csv
+    ├── UNITE_public_all_19.02.2025.csv
+...
 ```
 
 Where app.R is the Shiny App File and data are the header files for the different UNITE datasets that will be built in. The user will be able to select one of these in the form of a drop-down menu.
@@ -55,11 +66,14 @@ Next define your UI:
 ```
 ui <- fluidPage(
   titlePanel("UNITE Database Taxon Matching"),
+
   sidebarLayout(
     sidebarPanel(
-      selectInput("unite_version", "Select UNITE Version:", choices = unite_versions),    #selectInput specifies a drop-down menu option
+      selectInput("unite_version", "Select UNITE Version:", choices = unite_versions),    #selectInput, "choices =" specifies a drop-down menu option
       fileInput("taxa_file", "Upload Taxon List CSV:", accept = ".csv"),      #this will be the required input spreadsheet from the user
-      fileInput("syn_file", "Upload GBIF/NBN Synonyms CSV (optional):", accept = ".csv"),      #this is the optional second file to check for any synonyms
+
+      uiOutput("column_select_ui"), #once the file is uploaded the ui outputs to a column selection step
+
       actionButton("run", "Run Matching"),        #This is the button to run the order of operations that we will specify next 
       downloadButton("download", "Download Matched Data")    #This will allow the user to download the output 
     ),
@@ -78,52 +92,74 @@ The next step is to specify the functions and order of operations:
 
 ```
 server <- function(input, output, session) {
-  observeEvent(input$run, {
+
+## input requirements: step 1 is the inputfile and then in reaction to that file being uploaded then the CSV is read 
+   taxa_data <- reactive({
     req(input$taxa_file)
+    read.csv(input$taxa_file$datapath, stringsAsFactors = FALSE)
+  })
 
-    # Load selected UNITE version
-    unite_path <- file.path("data", input$unite_version)
-    df <- read.csv(unite_path, stringsAsFactors = FALSE)
+# Dynamically create column selectors once file is uploaded
+  output$column_select_ui <- renderUI({
+    req(taxa_data())
+    colnames_df <- names(taxa_data())
 
-    # Load and clean taxon data
-    taxa_df <- read.csv(input$taxa_file$datapath, stringsAsFactors = FALSE)
-    taxa_df$Taxon.name <- gsub("var\\.|f\\.|s\\.|str\\.|lat\\.|subsp\\.", "", taxa_df$Taxon.name)
-    taxa_df$Taxon.name <- trimws(taxa_df$Taxon.name)
+## tagList() creates a simple list of tags to be seen in the ui ("choices =" specifies a drop-down option)
+    tagList(
+      selectInput("taxon_col", "Select Taxon Name Column:", choices = colnames_df),
+      selectInput("synonym_col", "Select Synonym Column (optional):", choices = c("None", colnames_df))
+    )
+  })
 
-    taxa_df$UNITE.Record <- taxa_df$Taxon.name %in% df$Species
-    if ("Recent.Synonym" %in% colnames(taxa_df)) {
-      taxa_df$UNITE.Record.Synonym <- taxa_df$Recent.Synonym %in% df$Species
-      taxa_df[is.na(taxa_df$Recent.Synonym), "UNITE.Record.Synonym"] <- NA
+observeEvent(input$run, {
+    req(taxa_data(), input$taxon_col)
+
+    # Load selected UNITE database version
+    unite_df <- read.csv(file.path("data", input$unite_version), stringsAsFactors = FALSE)
+
+    # Clean species names
+    unite_df$Species <- str_trim(unite_df$Species)
+
+    # Work with user data
+    taxa_df <- taxa_data()
+
+    # Clean taxon names
+    taxa_df$CleanTaxon <- gsub("var\\.|f\\.|s\\.|str\\.|lat\\.|subsp\\.", "", taxa_df[[input$taxon_col]])
+    taxa_df$CleanTaxon <- trimws(taxa_df$CleanTaxon)
+
+    taxa_df$UNITE.Record <- taxa_df$CleanTaxon %in% unite_df$Species
+
+# If synonym column selected and not "None"
+    if (!is.null(input$synonym_col) && input$synonym_col != "None") {
+      taxa_df$CleanSynonym <- gsub("var\\.|f\\.|s\\.|str\\.|lat\\.|subsp\\.", "", taxa_df[[input$synonym_col]])
+      taxa_df$CleanSynonym <- trimws(taxa_df$CleanSynonym)
+      taxa_df$UNITE.Record.Synonym <- taxa_df$CleanSynonym %in% unite_df$Species
+      taxa_df[is.na(taxa_df[[input$synonym_col]]), "UNITE.Record.Synonym"] <- NA
     }
 
-    if (!is.null(input$syn_file)) {
-      syn_df <- read.csv(input$syn_file$datapath, stringsAsFactors = FALSE)
-      item_counts <- sapply(unique(taxa_df$Taxon.name), function(x) sum(df$Species == x))
-      df2 <- data.frame(item = unique(taxa_df$Taxon.name), count = item_counts)
-
-      taxa_df <- taxa_df %>%
-        left_join(df2, by = c("Taxon.name" = "item")) %>%
-        left_join(syn_df, by = c("taxonID" = "taxon_id"))
-
-      colnames(taxa_df)[ncol(taxa_df)] <- "synonym.name"
-      taxa_df$Synonym.UNITE.Record <- taxa_df$synonym.name %in% df$Species
-    }
-
+# Output preview
     output$preview <- renderTable({
       head(taxa_df, 20)
     })
 
+    # Output summary stats
     output$summary <- renderPrint({
-      list(
-        UNITE_matches = sum(taxa_df$UNITE.Record, na.rm = TRUE),
-        Synonym_matches = if ("UNITE.Record.Synonym" %in% colnames(taxa_df))
-          sum(taxa_df$UNITE.Record.Synonym, na.rm = TRUE) else NA
-      )
-    })
+      num_direct <- sum(taxa_df$UNITE.Record, na.rm = TRUE)
+      num_syn <- if ("UNITE.Record.Synonym" %in% names(taxa_df))               sum(taxa_df$UNITE.Record.Synonym, na.rm = TRUE) else 0
+      num_any <- sum(taxa_df$UNITE.Match.Any, na.rm = TRUE)
 
+  list(
+    Total_Records = nrow(taxa_df),
+    UNITE_Matches = num_direct,
+    Synonym_Matches = if (num_syn > 0) num_syn else "N/A",
+    Total_Matches_Combined = num_any
+  )
+})
+
+    # Enable download
     output$download <- downloadHandler(
       filename = function() {
-        paste0("matched_taxa_", Sys.Date(), ".csv")
+        paste0("UNITE_matches_", Sys.Date(), ".csv")
       },
       content = function(file) {
         write.csv(taxa_df, file, row.names = FALSE)
